@@ -1,0 +1,60 @@
+name: Build and Deploy to AWS Lambda via ECR
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        env:
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }} # e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com/my-app
+        run: |
+          set -e
+          COMMIT=${GITHUB_SHA::7}
+          IMAGE_URI=${ECR_REPOSITORY}:${COMMIT}
+          LATEST_URI=${ECR_REPOSITORY}:latest
+
+          docker build --progress=plain --tag $IMAGE_URI --tag $LATEST_URI .
+          docker push $IMAGE_URI
+          docker push $LATEST_URI
+
+          echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_OUTPUT
+
+      - name: Publish Lambda image (update function)
+        env:
+          LAMBDA_NAME: ${{ secrets.LAMBDA_FUNCTION_NAME }}
+          IMAGE_URI: ${{ steps.build-and-deploy.outputs.IMAGE_URI }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+        run: |
+          # update function to use new image
+          aws lambda update-function-code \
+            --function-name $LAMBDA_NAME \
+            --image-uri $IMAGE_URI \
+            --region $AWS_REGION
+
+          # publish immutable version
+          VERSION=$(aws lambda publish-version --function-name $LAMBDA_NAME --region $AWS_REGION --query Version --output text)
+          echo "Published version $VERSION"
+
+          # update or create alias 'prod' to point to this version
+          aws lambda update-alias --function-name $LAMBDA_NAME --name prod --function-version $VERSION --region $AWS_REGION || \
+            aws lambda create-alias --function-name $LAMBDA_NAME --name prod --function-version $VERSION --region $AWS_REGION
